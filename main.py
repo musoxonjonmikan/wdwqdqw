@@ -1,12 +1,8 @@
 import os
 import logging
 import asyncio
-import ssl
 from typing import Optional
-from urllib.parse import urlparse
-
-import pg8000.dbapi as pg
-
+from pymongo import MongoClient
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -18,9 +14,9 @@ from telegram.ext import (
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-BOT_TOKEN     = os.environ["BOT_TOKEN"]
-DATABASE_URL  = os.environ["DATABASE_URL"]
-WEBHOOK_URL   = os.environ.get("WEBHOOK_URL", "")
+BOT_TOKEN     = os.environ.get("BOT_TOKEN", "8883352839:AAGMdKlOhpgZgfjo6jdsNOJ2maMD9i_I-Nw")
+DATABASE_URL  = os.environ.get("DATABASE_URL", "mongodb+srv://musoxonshovkatov_db_user:2010@cluster.ivoyjac.mongodb.net/?appName=Cluster")
+WEBHOOK_URL   = os.environ.get("WEBHOOK_URL", "https://your-render-app.onrender.com")
 PORT          = int(os.environ.get("PORT", 8080))
 
 CHANNEL_1_USERNAME = "@ucplanet"
@@ -41,203 +37,100 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Database connection ───────────────────────────────────────────────────────
+# ─── MongoDB connection ───────────────────────────────────────────────────────
 
-def _parse_db_url(url: str) -> dict:
-    r = urlparse(url)
-    params = dict(
-        host=r.hostname,
-        port=r.port or 5432,
-        database=r.path.lstrip("/"),
-        user=r.username,
-        password=r.password,
-    )
-    if "sslmode=disable" not in url:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        params["ssl_context"] = ctx
-    return params
+client = MongoClient(DATABASE_URL)
+db = client["bot_db"]
 
-
-_DB_PARAMS = _parse_db_url(DATABASE_URL)
-
-
-def _connect():
-    return pg.connect(**_DB_PARAMS)
-
-
-def _row_to_dict(cursor, row) -> Optional[dict]:
-    if row is None:
-        return None
-    cols = [d[0] for d in cursor.description]
-    return dict(zip(cols, row))
+users_col = db["bot_users"]
+join_col = db["join_requests"]
 
 
 # ─── DB setup ─────────────────────────────────────────────────────────────────
 
 def init_db():
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_users (
-            telegram_id    BIGINT PRIMARY KEY,
-            username       TEXT,
-            first_name     TEXT NOT NULL,
-            started_at     TIMESTAMP DEFAULT NOW(),
-            is_verified    BOOLEAN DEFAULT FALSE,
-            invited_by     BIGINT,
-            referral_count INTEGER DEFAULT 0,
-            join_link_sent BOOLEAN DEFAULT FALSE
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS join_requests (
-            id           SERIAL PRIMARY KEY,
-            user_id      BIGINT NOT NULL,
-            chat_id      BIGINT NOT NULL,
-            requested_at TIMESTAMP DEFAULT NOW(),
-            UNIQUE(user_id, chat_id)
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.info("Database initialised")
+    logger.info("MongoDB connected successfully")
 
 
 # ─── DB helpers ───────────────────────────────────────────────────────────────
 
-def upsert_user(telegram_id: int, username: Optional[str], first_name: str,
-                invited_by: Optional[int] = None) -> Optional[dict]:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO bot_users (telegram_id, username, first_name, invited_by)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (telegram_id) DO UPDATE SET
-            username   = EXCLUDED.username,
-            first_name = EXCLUDED.first_name,
-            invited_by = CASE
-                WHEN bot_users.invited_by IS NULL THEN EXCLUDED.invited_by
-                ELSE bot_users.invited_by
-            END
-        RETURNING *
-    """, (telegram_id, username, first_name, invited_by))
-    row = _row_to_dict(cur, cur.fetchone())
-    conn.commit()
-    cur.close()
-    conn.close()
-    return row
+def upsert_user(telegram_id: int, username, first_name, invited_by=None):
+    return users_col.find_one_and_update(
+        {"telegram_id": telegram_id},
+        {
+            "$set": {
+                "username": username,
+                "first_name": first_name,
+            },
+            "$setOnInsert": {
+                "telegram_id": telegram_id,
+                "is_verified": False,
+                "referral_count": 0,
+                "join_link_sent": False,
+                "invited_by": invited_by,
+            }
+        },
+        upsert=True
+    )
 
-
-def get_user(telegram_id: int) -> Optional[dict]:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM bot_users WHERE telegram_id = %s", (telegram_id,))
-    row = _row_to_dict(cur, cur.fetchone())
-    cur.close()
-    conn.close()
-    return row
+def get_user(telegram_id: int):
+    return users_col.find_one({"telegram_id": telegram_id})
 
 
 def set_verified(telegram_id: int):
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE bot_users SET is_verified = TRUE WHERE telegram_id = %s", (telegram_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    users_col.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {"is_verified": True}}
+    )
 
 
 def set_join_link_sent(telegram_id: int):
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE bot_users SET join_link_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    users_col.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {"join_link_sent": True}}
+    )
 
 
 def increment_referral_count(telegram_id: int) -> int:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE bot_users SET referral_count = referral_count + 1 "
-        "WHERE telegram_id = %s RETURNING referral_count",
-        (telegram_id,),
+    res = users_col.find_one_and_update(
+        {"telegram_id": telegram_id},
+        {"$inc": {"referral_count": 1}},
+        return_document=True
     )
-    row = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
-    return row[0] if row else 0
+    return res.get("referral_count", 0)
 
 
 def record_join_request(user_id: int, chat_id: int):
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO join_requests (user_id, chat_id) VALUES (%s, %s) "
-        "ON CONFLICT (user_id, chat_id) DO NOTHING",
-        (user_id, chat_id),
+    join_col.update_one(
+        {"user_id": user_id, "chat_id": chat_id},
+        {"$setOnInsert": {"user_id": user_id, "chat_id": chat_id}},
+        upsert=True
     )
-    conn.commit()
-    cur.close()
-    conn.close()
 
 
 def has_join_request(user_id: int, chat_id: int) -> bool:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id FROM join_requests WHERE user_id = %s AND chat_id = %s",
-        (user_id, chat_id),
-    )
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return row is not None
-
+    return join_col.find_one({"user_id": user_id, "chat_id": chat_id}) is not None
 
 def get_total_user_count() -> int:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM bot_users")
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return row[0] if row else 0
+    return users_col.count_documents({})
 
 
 def get_all_user_ids() -> list:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("SELECT telegram_id FROM bot_users")
-    rows = [r[0] for r in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return rows
+    return [u["telegram_id"] for u in users_col.find({}, {"telegram_id": 1})]
 
 
 def clear_all_referrals() -> int:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM join_requests")
-    cur.execute("""
-        UPDATE bot_users SET
-            is_verified    = FALSE,
-            referral_count = 0,
-            join_link_sent = FALSE,
-            invited_by     = NULL
-    """)
-    cur.execute("SELECT COUNT(*) FROM bot_users")
-    row = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
-    return row[0] if row else 0
-
+    join_col.delete_many({})
+    users_col.update_many(
+        {},
+        {"$set": {
+            "is_verified": False,
+            "referral_count": 0,
+            "join_link_sent": False,
+            "invited_by": None
+        }}
+    )
+    return users_col.count_documents({})
 
 # ─── Bot helpers ──────────────────────────────────────────────────────────────
 
@@ -247,7 +140,7 @@ def ref_link(user_id: int) -> str:
 
 def subscription_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 1-Kanal | @ucplanet", url="https://t.me/ucplanet")],
+        [InlineKeyboardButton("📢 1-Kanal | " + CHANNEL_1_USERNAME, url="https://t.me/" + CHANNEL_1_USERNAME.replace("@", ""))],
         [InlineKeyboardButton("🔐 2-Kanal | Qo'shilish so'rovi yuboring", url=CHANNEL_2_LINK)],
         [InlineKeyboardButton("🔐 3-Kanal | Qo'shilish so'rovi yuboring", url=CHANNEL_3_LINK)],
         [InlineKeyboardButton("✅ Tekshirish", callback_data="check_subs")],
@@ -304,7 +197,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎮 <b>PUBG UC Konkursiga xush kelibsiz!</b> 🏆\n\n"
         "💎 <b>100 UC</b> yutib olish imkoniyatini qo'ldan boy bermang!\n\n"
         "📋 <b>Ishtirok etish uchun:</b>\n"
-        "✅ 1-Kanalga obuna bo'ing\n"
+        "✅ 1-Kanalga obuna bo'ling\n"
         "✅ 2 va 3-kanalga qo'shilish so'rovi yuboring\n\n"
         "⬇️ <i>Quyidagi kanallarga o'ting va so'ng \"Tekshirish\" tugmasini bosing:</i>",
         reply_markup=subscription_keyboard(),
@@ -321,12 +214,12 @@ async def check_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("❗ Iltimos, /start buyrug'ini yuboring.")
         return
 
-    if db_user["is_verified"]:
+    if db_user.get("is_verified", False):
         await query.message.reply_html(
             f"✅ <b>Siz allaqachon ro'yxatdan o'tgansiz!</b>\n\n"
             f"🔗 Sizning shaxsiy havolangiz:\n"
             f"{ref_link(user.id)}\n\n"
-            f"👥 Taklif qilganlar: <b>{db_user['referral_count']}</b> / {REQUIRED_INVITES}"
+            f"👥 Taklif qilganlar: <b>{db_user.get('referral_count', 0)}</b> / {REQUIRED_INVITES}"
         )
         return
 
@@ -337,7 +230,7 @@ async def check_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (ch1ok and ch2ok and ch3ok):
         lines = ["❌ <b>Barcha shartlar bajarilmagan!</b>\n"]
         lines.append(
-            ("✅" if ch1ok else "❌") + " 1-Kanal (@ucplanet) — " +
+            ("✅" if ch1ok else "❌") + f" 1-Kanal ({CHANNEL_1_USERNAME}) — " +
             ("Obuna bo'lgansiz" if ch1ok else "Obuna bo'lmadingiz")
         )
         lines.append(
@@ -354,9 +247,9 @@ async def check_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     set_verified(user.id)
 
-    if db_user["invited_by"]:
+    if db_user.get("invited_by"):
         inviter = get_user(db_user["invited_by"])
-        if inviter and not inviter["join_link_sent"]:
+        if inviter and not inviter.get("join_link_sent", False):
             new_count = increment_referral_count(db_user["invited_by"])
             try:
                 await context.bot.send_message(
@@ -440,13 +333,15 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 Ta'sirlangan foydalanuvchilar: <b>{total}</b>"
     )
 
+# ─── Entry point (Custom Async Event Loop Mode) ───────────────────────────────
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
-
-def main():
+async def run_bot():
     init_db()
 
+    # Build python-telegram-bot application
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(check_subs, pattern="^check_subs$"))
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
@@ -454,20 +349,35 @@ def main():
     app.add_handler(CommandHandler("xabar", xabar_command))
     app.add_handler(CommandHandler("clear", clear_command))
 
-    if WEBHOOK_URL:
-        webhook_path = f"/webhook/{BOT_TOKEN}"
-        full_url = f"{WEBHOOK_URL}{webhook_path}"
-        logger.info(f"Webhook mode: {full_url}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=full_url,
-            url_path=webhook_path,
-            drop_pending_updates=True,
-        )
-    else:
-        logger.info("Polling mode")
-        app.run_polling(drop_pending_updates=True)
+    logger.info("Initializing bot with custom async runner...")
+    
+    # When running manually inside an async event loop in python-telegram-bot v20+
+    # we initialize, start, and turn on the polling process asynchronously.
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        
+        logger.info("Bot is active and polling. Idling now...")
+        
+        # ⚠️ CRITICAL FIX FOR YOUR ERROR:
+        # 'Updater' object has no attribute 'idle' in python-telegram-bot v20+
+        # 'idle' is now an asynchronous coroutine method on the Application itself!
+        # DO NOT call: await app.updater.idle()
+        # DO call:     await app.idle()
+        await app.idle()
+        
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+
+def main():
+    try:
+        # Standard Python entry to run our async main runner
+        asyncio.run(run_bot())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped by user.")
 
 
 if __name__ == "__main__":
